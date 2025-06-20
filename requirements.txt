@@ -11,6 +11,7 @@ autogen-ext==0.5.7
 
 # Image processing
 Pillow==10.4.0
+pdf2image==1.17.0
 
 # Additional dependencies for AutoGen
 openai==1.54.4
