@@ -121,9 +121,13 @@ PassportOCRApplication (Main Application)
    - Create credentials (OAuth 2.0 Client ID)
    - Download the credentials file as `config/client_secret.json`
 
-5. **Set up Gemini API key**
+5. **Set up environment variables**
    ```bash
-   export GEMINI_API_KEY="your-gemini-api-key"
+   # Copy the example file
+   cp .env.example .env
+   
+   # Edit .env file and add your Gemini API key
+   # GEMINI_API_KEY=your_actual_gemini_api_key_here
    ```
 
 ## 📖 Usage
@@ -201,10 +205,21 @@ Progress: 15/50 (30.0%) | Success: 12 | Failed: 2 | Retried: 1 | ETA: 45.2s | Cu
 
 ### Environment Variables
 
+The application uses a `.env` file for configuration. Copy `.env.example` to `.env` and configure:
+
 - `GEMINI_API_KEY`: Your Google Gemini API key (required)
+
+Optional configuration variables:
+- `MAX_CONCURRENT_FILES`: Number of files to process concurrently (default: 3)
+- `MAX_RETRIES`: Maximum retry attempts for failed operations (default: 3)
+- `RETRY_DELAY`: Initial retry delay in seconds (default: 1.0)
+- `RETRY_BACKOFF_FACTOR`: Exponential backoff multiplier (default: 2.0)
+- `MAX_RETRY_DELAY`: Maximum retry delay in seconds (default: 60.0)
+- `OUTPUT_FILE`: Output file path (default: ocr_results.json)
 
 ### Configuration Files
 
+- `.env`: Environment variables (copy from `.env.example`)
 - `config/client_secret.json`: Google Drive API credentials
 - `token.json`: OAuth2 token (auto-generated on first run)
 
@@ -420,6 +435,7 @@ pip install -r requirements-test.txt
 - **`Pillow==10.4.0`**: Image processing
 - **`pdf2image==1.17.0`**: PDF to image conversion
 - **`pydantic==2.10.3`**: Data validation
+- **`python-dotenv==1.0.0`**: Environment variable management
 
 ### Testing Dependencies
 
@@ -459,7 +475,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ### Common Issues
 
 1. **Authentication Error**: Ensure `config/client_secret.json` is properly configured
-2. **API Key Error**: Verify `GEMINI_API_KEY` environment variable is set
+2. **API Key Error**: Verify `GEMINI_API_KEY` is set in your `.env` file
 3. **Import Error**: Check that all dependencies are installed in the virtual environment
 4. **OCR Processing Error**: Ensure image files are in supported formats (PNG, JPG, JPEG, GIF, BMP, PDF)
 5. **PDF Conversion Error**: Install poppler-utils: `brew install poppler` (macOS) or `apt-get install poppler-utils` (Ubuntu)

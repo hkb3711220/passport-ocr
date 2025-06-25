@@ -14,6 +14,7 @@ from typing import NoReturn, List, Dict, Any, Optional, Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
+from dotenv import load_dotenv
 from pdf2image import convert_from_path
 from src.gdrive_downloader.drive_client import DriveClient
 from src.gdrive_downloader.exceptions import GDriveDownloaderError
@@ -742,7 +743,7 @@ class PassportOCRApplication:
 
 
 def create_config_from_args() -> AppConfig:
-    """Create application configuration from command line arguments.
+    """Create application configuration from command line arguments and environment.
 
     Returns:
         Application configuration.
@@ -750,15 +751,20 @@ def create_config_from_args() -> AppConfig:
     Raises:
         SystemExit: If arguments are invalid or API key is missing.
     """
+    # Load environment variables from .env file
+    load_dotenv()
+    
     if len(sys.argv) != 2:
         print("Usage: python main.py <folder_id>")
+        print("Make sure to set GEMINI_API_KEY in your .env file")
         sys.exit(1)
 
     folder_id = sys.argv[1]
 
     api_key = os.getenv('GEMINI_API_KEY')
     if not api_key:
-        print("Error: GEMINI_API_KEY environment variable not set")
+        print("Error: GEMINI_API_KEY not found in environment variables")
+        print("Please set GEMINI_API_KEY in your .env file or environment")
         sys.exit(1)
 
     return AppConfig(folder_id=folder_id, api_key=api_key)
