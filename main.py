@@ -6,9 +6,13 @@ import logging
 import os
 import sys
 import tempfile
+import time
+import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NoReturn, List, Dict, Any, Optional
+from typing import NoReturn, List, Dict, Any, Optional, Callable
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
 from pdf2image import convert_from_path
 from src.gdrive_downloader.drive_client import DriveClient
@@ -56,6 +60,11 @@ class AppConfig:
     api_key: str
     output_file: str = "ocr_results.json"
     log_level: int = logging.INFO
+    max_concurrent_files: int = 3
+    max_retries: int = 3
+    retry_delay: float = 1.0
+    retry_backoff_factor: float = 2.0
+    max_retry_delay: float = 60.0
 
 
 class FileProcessor:
@@ -254,6 +263,120 @@ class FileProcessor:
         }
 
 
+class ProgressTracker:
+    """Handles progress tracking and display."""
+
+    def __init__(self, total_files: int, logger: logging.Logger):
+        self.total_files = total_files
+        self.processed_files = 0
+        self.successful_files = 0
+        self.failed_files = 0
+        self.retried_files = 0
+        self.start_time = time.time()
+        self.logger = logger
+
+    def update_progress(self, success: bool = True, retry: bool = False) -> None:
+        """Update progress counters."""
+        self.processed_files += 1
+        if success:
+            self.successful_files += 1
+        else:
+            self.failed_files += 1
+        if retry:
+            self.retried_files += 1
+
+    def display_progress(self, current_file: str = "") -> None:
+        """Display current progress."""
+        elapsed_time = time.time() - self.start_time
+        if self.processed_files > 0:
+            avg_time_per_file = elapsed_time / self.processed_files
+            eta = avg_time_per_file * (self.total_files - self.processed_files)
+        else:
+            eta = 0
+
+        progress_percent = (self.processed_files / self.total_files) * 100 if self.total_files > 0 else 0
+        
+        progress_msg = (
+            f"Progress: {self.processed_files}/{self.total_files} "
+            f"({progress_percent:.1f}%) | "
+            f"Success: {self.successful_files} | "
+            f"Failed: {self.failed_files} | "
+            f"Retried: {self.retried_files} | "
+            f"ETA: {eta:.1f}s"
+        )
+        
+        if current_file:
+            progress_msg += f" | Current: {current_file}"
+            
+        self.logger.info(progress_msg)
+        print(f"\r{progress_msg}", end="", flush=True)
+
+    def display_final_summary(self) -> None:
+        """Display final processing summary."""
+        total_time = time.time() - self.start_time
+        print(f"\n{'='*80}")
+        print(f"PROCESSING COMPLETE")
+        print(f"{'='*80}")
+        print(f"Total files: {self.total_files}")
+        print(f"Successful: {self.successful_files}")
+        print(f"Failed: {self.failed_files}")
+        print(f"Retried: {self.retried_files}")
+        print(f"Total time: {total_time:.2f}s")
+        print(f"Average time per file: {total_time/self.processed_files:.2f}s" if self.processed_files > 0 else "N/A")
+        print(f"{'='*80}")
+
+
+class RetryHandler:
+    """Handles retry logic with exponential backoff."""
+
+    def __init__(self, config: AppConfig, logger: logging.Logger):
+        self.config = config
+        self.logger = logger
+
+    async def retry_with_backoff(
+        self, 
+        func: Callable, 
+        *args, 
+        operation_name: str = "operation",
+        **kwargs
+    ) -> Any:
+        """Execute function with exponential backoff retry logic."""
+        last_exception = None
+        
+        for attempt in range(self.config.max_retries + 1):
+            try:
+                if attempt > 0:
+                    self.logger.info(f"Retry attempt {attempt}/{self.config.max_retries} for {operation_name}")
+                
+                result = await func(*args, **kwargs)
+                
+                if attempt > 0:
+                    self.logger.info(f"Successfully completed {operation_name} after {attempt} retries")
+                
+                return result
+                
+            except Exception as e:
+                last_exception = e
+                
+                if attempt == self.config.max_retries:
+                    self.logger.error(f"Final retry failed for {operation_name}: {e}")
+                    break
+                
+                delay = min(
+                    self.config.retry_delay * (self.config.retry_backoff_factor ** attempt),
+                    self.config.max_retry_delay
+                )
+                
+                # Add jitter to prevent thundering herd
+                jitter = random.uniform(0.1, 0.3) * delay
+                delay += jitter
+                
+                self.logger.warning(f"Attempt {attempt + 1} failed for {operation_name}: {e}. Retrying in {delay:.2f}s")
+                await asyncio.sleep(delay)
+        
+        raise last_exception
+
+
 class ResultDisplayer:
     """Handles result display operations."""
 
@@ -319,18 +442,21 @@ class OCRProcessor:
         file_processor: FileProcessor,
         result_displayer: ResultDisplayer,
         logger: logging.Logger,
-        output_file: str
+        output_file: str,
+        config: AppConfig
     ):
         self.ocr_client = ocr_client
         self.file_processor = file_processor
         self.result_displayer = result_displayer
         self.logger = logger
         self.output_file = output_file
+        self.config = config
+        self.retry_handler = RetryHandler(config, logger)
         self.existing_results = self.file_processor.load_existing_results(
             output_file)
 
     async def process_single_image(self, image_path: str, original_filename: str = None) -> Optional[Dict[str, Any]]:
-        """Process a single image file with OCR.
+        """Process a single image file with OCR with retry logic.
 
         Args:
             image_path: Path to the image file to process.
@@ -340,12 +466,17 @@ class OCRProcessor:
             Dictionary containing processing result or None if failed.
         """
         display_name = original_filename or Path(image_path).name
-        self.logger.info(f"Processing OCR for: {display_name}")
+        
+        async def _ocr_operation():
+            return await self.ocr_client.ocr(OCR_PROMPT, image_path)
 
         try:
-            ocr_response = await self.ocr_client.ocr(OCR_PROMPT, image_path)
-            self.result_displayer.display_ocr_result(
-                display_name, ocr_response)
+            ocr_response = await self.retry_handler.retry_with_backoff(
+                _ocr_operation,
+                operation_name=f"OCR processing for {display_name}"
+            )
+            
+            self.result_displayer.display_ocr_result(display_name, ocr_response)
 
             # Use original filename if provided, otherwise use image path
             result_entry = self.file_processor.create_result_entry(
@@ -357,7 +488,7 @@ class OCRProcessor:
             return result_entry
 
         except Exception as e:
-            self.logger.error(f"OCR failed for {display_name}: {e}")
+            self.logger.error(f"OCR failed for {display_name} after all retries: {e}")
             error_entry = self.file_processor.create_error_entry(image_path, e)
             if original_filename:
                 error_entry["filename"] = original_filename
@@ -444,7 +575,7 @@ class OCRProcessor:
                 self.file_processor.cleanup_temp_files(temp_image_paths)
 
     async def process_all_files(self, downloaded_files: List[str]) -> List[Dict[str, Any]]:
-        """Process all downloaded files with OCR.
+        """Process all downloaded files with OCR using batch processing.
 
         Args:
             downloaded_files: List of downloaded file paths.
@@ -461,28 +592,84 @@ class OCRProcessor:
                 results.append(result)
                 successful_existing_results[filename] = result
 
-        # Process files (new files + files with previous errors)
-        new_files_processed = 0
-        retry_files_processed = 0
-
+        # Filter files that need processing
+        files_to_process = []
         for file_path in downloaded_files:
-            filename = Path(file_path).name
-            was_error_retry = (filename in self.existing_results and
-                               'error' in self.existing_results[filename])
+            if not self.file_processor.is_already_processed(file_path, self.existing_results):
+                files_to_process.append(file_path)
 
-            result = await self.process_single_file(file_path)
-            if result is not None:
-                # Only add if it's a new result (not from successful existing results)
-                if not self.file_processor.is_already_processed(file_path, self.existing_results):
+        if not files_to_process:
+            self.logger.info("No new files to process")
+            return results
+
+        # Initialize progress tracker
+        progress_tracker = ProgressTracker(len(files_to_process), self.logger)
+        
+        self.logger.info(f"Starting batch processing of {len(files_to_process)} files with max {self.config.max_concurrent_files} concurrent operations")
+
+        # Create semaphore to limit concurrent operations
+        semaphore = asyncio.Semaphore(self.config.max_concurrent_files)
+
+        async def process_with_semaphore(file_path: str) -> Optional[Dict[str, Any]]:
+            """Process a single file with concurrency control."""
+            async with semaphore:
+                filename = Path(file_path).name
+                was_error_retry = (filename in self.existing_results and
+                                   'error' in self.existing_results[filename])
+                
+                progress_tracker.display_progress(filename)
+                
+                try:
+                    result = await self.process_single_file(file_path)
+                    success = result is not None and 'error' not in result
+                    progress_tracker.update_progress(success=success, retry=was_error_retry)
+                    return result
+                except Exception as e:
+                    self.logger.error(f"Unexpected error processing {filename}: {e}")
+                    progress_tracker.update_progress(success=False, retry=was_error_retry)
+                    return self.file_processor.create_error_entry(file_path, e)
+
+        # Process files concurrently
+        try:
+            batch_results = await asyncio.gather(
+                *[process_with_semaphore(file_path) for file_path in files_to_process],
+                return_exceptions=True
+            )
+
+            # Process results
+            new_files_processed = 0
+            retry_files_processed = 0
+
+            for i, result in enumerate(batch_results):
+                if isinstance(result, Exception):
+                    self.logger.error(f"Batch processing error for {files_to_process[i]}: {result}")
+                    error_result = self.file_processor.create_error_entry(files_to_process[i], result)
+                    results.append(error_result)
+                elif result is not None:
                     results.append(result)
+                    
+                    filename = Path(files_to_process[i]).name
+                    was_error_retry = (filename in self.existing_results and
+                                       'error' in self.existing_results[filename])
+                    
                     if was_error_retry:
                         retry_files_processed += 1
                     else:
                         new_files_processed += 1
 
+        except Exception as e:
+            self.logger.error(f"Batch processing failed: {e}")
+            raise
+
+        # Display final summary
+        progress_tracker.display_final_summary()
+        
         successful_count = len(successful_existing_results)
         self.logger.info(
-            f"Processed {new_files_processed} new files, {retry_files_processed} retry files, {successful_count} existing successful files")
+            f"Batch processing complete: {new_files_processed} new files, "
+            f"{retry_files_processed} retry files, {successful_count} existing successful files"
+        )
+        
         return results
 
 
@@ -529,7 +716,8 @@ class PassportOCRApplication:
                 self.file_processor,
                 self.result_displayer,
                 self.logger,
-                self.config.output_file
+                self.config.output_file,
+                self.config
             )
 
             # Process files
